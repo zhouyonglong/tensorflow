@@ -285,17 +285,19 @@ __global__ void SwapDimension1And2InTensor3UsingTiles(const T* input,
 // kTileLength (we currently set it to 64) and its height is small_dim,
 // We set the thread block's X dimension to be tile_num_per_block, and its Y
 // and Z to be one.
-template <typename T, bool SmallDim2>
+template <typename T, int ShmemSize, bool SmallDim2>
 __global__ void SwapDimension1And2InTensor3SmallDim(const T* input,
+                                                    int batch_per_block,
                                                     Dimension<3> input_dims,
                                                     T* output) {
   // TODO(yangzihao) avoid share memory bank conflict.
-  extern __shared__ __align__(sizeof(T)) unsigned char shmem[];
-  T* shared_memory_tile = reinterpret_cast<T*>(shmem);
+  __shared__ T shared_memory_tile[ShmemSize];
 
   eigen_assert(blockDim.y == 1);
   eigen_assert(blockDim.z == 1);
   eigen_assert(gridDim.z == 1);
+
+  int block_offset = blockIdx.x * blockDim.x;
 
   int x = threadIdx.x;
   int tile_height = blockDim.x;
@@ -303,40 +305,51 @@ __global__ void SwapDimension1And2InTensor3SmallDim(const T* input,
   // Get tile height, width, and thread/block origin indices.
   int small_dim = SmallDim2 ? input_dims[2] : input_dims[1];
   int large_dim = SmallDim2 ? input_dims[1] : input_dims[2];
-  int block_origin_idx = small_dim * large_dim * blockIdx.y;
-  int block_offset = blockIdx.x * blockDim.x;
-  int thread_origin_idx =
-      block_origin_idx + (SmallDim2 ? block_offset * small_dim : block_offset) +
-      x;
 
-  if (block_offset + blockDim.x > large_dim) {
-    tile_height = large_dim - block_offset;
-  }
+  int global_offset = small_dim * large_dim * (blockIdx.y * batch_per_block) +
+                      (SmallDim2 ? block_offset * small_dim : block_offset);
+  if (global_offset >= (input_dims[0] * input_dims[1] * input_dims[2])) return;
 
-  // Load a continous memory region to shared memory tile.
-  if (x < tile_height) {
-    for (int y = 0; y < small_dim; y++) {
-      int shmem_index = SmallDim2 ? (x + y * tile_height) : (x * small_dim + y);
-      shared_memory_tile[shmem_index] =
-          ldg(input + thread_origin_idx +
-              y * (SmallDim2 ? tile_height : large_dim));
+  for (int batch = 0; batch < batch_per_block; ++batch) {
+    int block_origin_idx =
+        small_dim * large_dim * (blockIdx.y * batch_per_block + batch);
+    int thread_origin_idx =
+        block_origin_idx +
+        (SmallDim2 ? block_offset * small_dim : block_offset) + x;
+
+    if (block_offset + blockDim.x > large_dim) {
+      tile_height = large_dim - block_offset;
     }
-  }
 
-  __syncthreads();
+    __syncthreads();
 
-  // Get block origin index for output array.
-  int output_block_offset = block_origin_idx;
-  int output_block_idx = SmallDim2 ? block_offset : block_offset * small_dim;
-  int output_block_origin_idx = output_block_offset + output_block_idx;
+    // Load a continuous memory region to shared memory tile.
+    if (x < tile_height) {
+      for (int y = 0; y < small_dim; y++) {
+        int shmem_index =
+            SmallDim2 ? (x + y * tile_height) : (x * small_dim + y);
+        shared_memory_tile[shmem_index] =
+            ldg(input + thread_origin_idx +
+                y * (SmallDim2 ? tile_height : large_dim));
+      }
+    }
 
-  // Store the tranposed memory region in shared memory to device.
-  if (x < tile_height) {
-    for (int y = 0; y < small_dim; y++) {
-      int output_idx = output_block_origin_idx + x +
-                       y * (SmallDim2 ? large_dim : tile_height);
-      int shmem_index = SmallDim2 ? (x * small_dim + y) : (x + y * tile_height);
-      output[output_idx] = shared_memory_tile[shmem_index];
+    __syncthreads();
+
+    // Get block origin index for output array.
+    int output_block_offset = block_origin_idx;
+    int output_block_idx = SmallDim2 ? block_offset : block_offset * small_dim;
+    int output_block_origin_idx = output_block_offset + output_block_idx;
+
+    // Store the tranposed memory region in shared memory to device.
+    if (x < tile_height) {
+      for (int y = 0; y < small_dim; y++) {
+        int output_idx = output_block_origin_idx + x +
+                         y * (SmallDim2 ? large_dim : tile_height);
+        int shmem_index =
+            SmallDim2 ? (x * small_dim + y) : (x + y * tile_height);
+        output[output_idx] = shared_memory_tile[shmem_index];
+      }
     }
   }
 }
@@ -498,8 +511,8 @@ void RunSwapDimension1And2InTensor3(const GPUDevice& d, const T* input,
                          input_dims[2] < kMinDimensionToUseTiles)) ||
                        ((input_dims[1] < kMinDimensionToUseTiles &&
                          input_dims[2] >= kMinDimensionToUseTiles));
-
   static const int NumSubTiles = 8;
+
   if (use_tiles) {
     static const int TileSize = 32;
     Dimension<3> input_dims_in_tiles = {
@@ -529,19 +542,21 @@ void RunSwapDimension1And2InTensor3(const GPUDevice& d, const T* input,
     //                  V                  V
     //    kTileLength(tile_height)    tile_height
     static const int kTileLength = 64;
-    int small_dim = std::min(input_dims[2], input_dims[1]);
+    static const int kGridDimY = 65535;
     int large_dim = std::max(input_dims[2], input_dims[1]);
     int tile_num_per_block = (large_dim + kTileLength - 1) / kTileLength;
+    int grid_dim_y = std::min(input_dims[0], kGridDimY);
+    int batch_per_block = (input_dims[0] + grid_dim_y - 1) / grid_dim_y;
     if (input_dims[2] < input_dims[1]) {
-      SwapDimension1And2InTensor3SmallDim<T, true>
-          <<<dim3(tile_num_per_block, input_dims[0]), kTileLength,
-             kTileLength * small_dim * sizeof(T), d.stream()>>>(
-              input, input_dims, output);
+      SwapDimension1And2InTensor3SmallDim<
+          T, kTileLength * kMinDimensionToUseTiles, true>
+          <<<dim3(tile_num_per_block, grid_dim_y), kTileLength, 0,
+             d.stream()>>>(input, batch_per_block, input_dims, output);
     } else {
-      SwapDimension1And2InTensor3SmallDim<T, false>
-          <<<dim3(tile_num_per_block, input_dims[0]), kTileLength,
-             kTileLength * small_dim * sizeof(T), d.stream()>>>(
-              input, input_dims, output);
+      SwapDimension1And2InTensor3SmallDim<
+          T, kTileLength * kMinDimensionToUseTiles, false>
+          <<<dim3(tile_num_per_block, grid_dim_y), kTileLength, 0,
+             d.stream()>>>(input, batch_per_block, input_dims, output);
     }
   } else {
     int total_element_count = input_dims[0] * input_dims[1] * input_dims[2];
@@ -660,6 +675,7 @@ template struct functor::NCHWToNHWC<GPUDevice, double, 4>;
 template struct functor::NCHWToNHWC<GPUDevice, float, 4>;
 template struct functor::NCHWToNHWC<GPUDevice, Eigen::half, 4>;
 
+template struct functor::PadInput<GPUDevice, int, int, 4>;
 template struct functor::PadInput<GPUDevice, float, int, 4>;
 template struct functor::PadInput<GPUDevice, Eigen::half, int, 4>;
 

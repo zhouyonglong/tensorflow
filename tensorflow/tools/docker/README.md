@@ -41,6 +41,7 @@ Note: If you would have a problem running nvidia-docker you may try the old meth
 we have used. But it is not recommended. If you find a bug in nvidia-docker, please report
 it there and try using nvidia-docker as described above.
 
+    $ # The old, not recommended way to run docker with gpu support: 
     $ export CUDA_SO=$(\ls /usr/lib/x86_64-linux-gnu/libcuda.* | xargs -I{} echo '-v {}:{}')
     $ export DEVICES=$(\ls /dev/nvidia* | xargs -I{} echo '--device {}:{}')
     $ docker run -it -p 8888:8888 $CUDA_SO $DEVICES gcr.io/tensorflow/tensorflow:latest-gpu
@@ -55,7 +56,7 @@ for additional containers, such as release candidates or nightly builds.
 ## Rebuilding the containers
 
 Building TensorFlow Docker containers should be done through the
-[parameterized_docker_build.sh](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/docker/README.md)
+[parameterized_docker_build.sh](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/tools/docker/parameterized_docker_build.sh)
 script. The raw Dockerfiles should not be used directly as they contain strings
 to be replaced by the script during the build.
 
